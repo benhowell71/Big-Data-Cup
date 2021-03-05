@@ -1,0 +1,908 @@
+---
+title: "Big Data Cup Women's Hockey"
+author: "Ben Howell"
+date: "1/28/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, 
+                      warning = FALSE, 
+                      message = FALSE,
+                      fig.align = "center")
+```
+
+Event %in% c("Faceoff Win", "Takeaway", "Puck Recovery") for events that start a possession w/ row_number
+1:18:00 moodboards stream: https://www.twitch.tv/videos/902736929
+
+```{r Load/Manipulate Data}
+library(tidyverse)
+library(grid)
+library(gganimate)
+library(gifski)
+library(mgcv)
+library(caret)
+library(nnet)
+library(Matrix)
+library(Ckmeans.1d.dp)
+library(mclust)
+library(broom)
+library(ggplot2)
+library(png)
+library(grid)
+library(raster)
+library(magick)
+library(mlr)
+library(knitr)
+library(cmna)
+library(xgboost)
+
+bdc <- read.csv("https://raw.githubusercontent.com/bigdatacup/Big-Data-Cup-2021/main/hackathon_womens.csv") %>%
+  mutate(League = "BDC")
+nwhl <- read.csv("https://raw.githubusercontent.com/bigdatacup/Big-Data-Cup-2021/main/hackathon_nwhl.csv") %>%
+  mutate(League = "NWHL")
+
+data <- rbind(bdc, nwhl)
+
+table(data$Event)
+goal_x <- c(188, 190, 190, 188)
+goal_y <- c(40, 40, 45, 45)
+
+goal <- data.frame(goal_x, goal_y)
+
+rink <- function(...) {
+  ggplot(...)  +
+  geom_segment(aes(x = 25 - 100, xend = 175 - 100, y = 0 - 42.5, yend = 0 - 42.5)) +
+  geom_segment(aes(x = 25 - 100, xend = 175 - 100, y = 85 - 42.5, yend = 85 - 42.5)) +
+  geom_segment(aes(x = 0 - 100, xend = 0 - 100, y = 20 - 42.5, yend = 60 - 42.5)) +
+  geom_segment(aes(x = 200 - 100, xend = 200 - 100, y = 20 - 42.5, yend = 60 - 42.5)) +
+  geom_curve(aes(x = 0 - 100, xend = 25 - 100, y = 60 - 42.5, yend = 85 - 42.5),
+             curvature = -0.32) +
+  geom_curve(aes(x = 0 - 100, xend = 25 - 100, y = 20 - 42.5, yend = 0 - 42.5),
+             curvature = 0.32) +
+  geom_curve(aes(x = 175 - 100, xend = 200 - 100, y = 0 - 42.5, yend = 20 - 42.5),
+             curvature = 0.32) +
+  geom_curve(aes(x = 175 - 100, xend = 200 -100, y = 85 - 42.5, yend = 60 - 42.5),
+             curvature = -0.32)  +
+  geom_path(data = goal, aes(x = goal_x - 100, y = goal_y - 42.5)) +
+  geom_segment(aes(x = 100 - 100, xend = 100 - 100, y = 85 - 42.5, yend = 0 - 42.5), size = 2, color = "red")
+}
+
+num <- nrow(data)
+
+Minute <- 0:20
+min_of_game <- 20:0
+
+time <- data.frame(Minute, min_of_game)
+
+data <- data %>%
+  mutate(X.Coordinate = X.Coordinate - 100,
+         X.Coordinate.2 = X.Coordinate.2 - 100,
+         Y.Coordinate = Y.Coordinate - 42.5,
+         Y.Coordinate.2 = Y.Coordinate.2 - 42.5,
+         row_num = row_number(),
+         Start_end = ifelse(Period == "1" & Clock == "20:00" & Event == "Faceoff Win", "Start", ""), #creates start of game and end of game variables
+         Start_end = ifelse((lead(Start_end) == "Start" & Period >= 3) | (row_num >= num), "End", 
+                            paste(Start_end)),
+         change_poss_two = ifelse(Start_end != "", paste(Start_end), 
+                              ifelse(lead(Team) != Team, "Turnover", "No Change")),
+         change_poss = ifelse(Start_end != "", "No Change", 
+                              ifelse(lead(Team) != Team, "Turnover", "No Change")),
+         Clock_two = paste(as.character(Clock))) %>%
+  separate(Clock_two, c("Minute", "Second"), sep = ":") %>%
+  mutate(Minute = as.numeric(as.character(Minute)))
+
+data <- right_join(data, time, by = "Minute")
+
+data <- data %>%
+  mutate(min_of_play = ifelse(Period == 2, min_of_game + 20,
+                              ifelse(Period == 3, min_of_game + 40,
+                                     ifelse(Period == 4, min_of_game + 60,
+                                            min_of_game + 0))),
+         Total_goals = Home.Team.Goals + Away.Team.Goals,
+         Event_tm_skaters = ifelse(Team == Home.Team, Home.Team.Skaters,
+                                   Away.Team.Skaters),
+         Opponent_tm_skaters = ifelse(Team == Home.Team, Away.Team.Skaters, Home.Team.Skaters))
+
+end <- data %>%
+  filter(Start_end %in% c("End")) %>%
+  dplyr::select(game_date, Home.Team, Away.Team, Home.Team.Goals, Away.Team.Goals) %>%
+  mutate(Winner = ifelse(Home.Team.Goals > Away.Team.Goals, paste(Home.Team),
+                         ifelse(Home.Team.Goals < Away.Team.Goals, paste(Away.Team),
+                                ifelse(Home.Team.Goals == Away.Team.Goals, "Tie", "Ugh"))),
+         Winner = ifelse(game_date == "2018-10-19", paste(Home.Team), paste(Winner))) %>%
+  dplyr::select(-Home.Team.Goals, -Away.Team.Goals)
+#manually set St. Lawrence as winner on 2018-10-19
+#game went to sudden overtime and final event recorded (a goal) is at a 3-3 tie
+
+data <- right_join(data, end, by = c("game_date", "Home.Team", "Away.Team"))
+
+store <- data 
+
+store <- store %>%
+  filter(Event %in% c("Faceoff Win", "Takeaway", "Puck Recovery")) %>%
+  mutate(Play_event = row_number()) #begin of a sequence of events for a team
+#ignores the potential for dump and chase w/ a Puck Recovery
+
+data <- left_join(data, store)
+
+data <- data %>%
+  fill(Play_event) #put sequences of plays together
+
+data <- data %>%
+  mutate(Goal_diff = Home.Team.Goals - Away.Team.Goals,
+         Win = ifelse(Winner == Home.Team, "Yes", "No"),
+         Event_tm_skaters = ifelse(Team == Home.Team, Home.Team.Skaters,
+                                   Away.Team.Skaters),
+         Opponent_tm_skaters = ifelse(Team == Home.Team, Away.Team.Skaters, Home.Team.Skaters),
+         Skate_diff = Event_tm_skaters - Opponent_tm_skaters,
+         label = ifelse(Event == "Goal", 1, 0),
+         label = as.factor(label))
+```
+
+# xgBoost xG Model
+
+```{r xgboost xG Model}
+# walkthrough and tutorial: https://www.datatechnotes.com/2020/08/regression-example-with-xgboost-in-r.html
+train_games <- data %>%
+  filter(League %in% c("NWHL")) 
+#split into testing and training games so that we can keep passing sequences intact
+test_games <- data %>%
+  filter(League == "BDC")
+
+train_shots <- train_games %>%
+  filter(Event %in% c("Shot", "Goal") & Detail.2 != "Blocked") %>%
+  dplyr::select(Event_tm_skaters, Opponent_tm_skaters, min_of_play, X.Coordinate, Y.Coordinate, 
+                Detail.1, Detail.2, Detail.3, Detail.4, Skate_diff, label)
+
+test_shots <- test_games %>%
+  filter(Event %in% c("Shot", "Goal") & Detail.2 != "Blocked") %>%
+  dplyr::select(Event_tm_skaters, Opponent_tm_skaters, min_of_play, X.Coordinate, Y.Coordinate, 
+                Detail.1, Detail.2, Detail.3, Detail.4, Skate_diff, label) 
+#removed blocked shots from the dataset
+
+train_x <- data.matrix(train_shots[, -11])
+train_y <- train_shots[, 11]
+
+test_x <- data.matrix(test_shots[, -11])
+test_y <- test_shots[, 11]
+
+xgb_train <- xgb.DMatrix(data = train_x, label = as.numeric(as.character(train_y)))
+xgb_test <- xgb.DMatrix(data = test_x, label = as.numeric(as.character(test_y)))
+
+xgb_train
+xgb_test
+```
+
+```{r}
+params <- list(booster = "gbtree", objective = "binary:logistic", eta = 0.3,
+               max_depth = 8)
+set.seed(25)
+xgbcv <- xgb.cv(params = params, data = xgb_train, nrounds = 100, nfold = 5, showsd = T, stratified = T, 
+                print_every_n = 10, early_stopping_rounds = 20, maximize = F)
+#need to figure out what the 'metrics' call here is doing, b/c it changes the output
+#will want to try "error"
+##best iteration = 10
+xgbcv
+set.seed(2)
+xgbc <- xgb.train(data = xgb_train, params = params, nrounds = 13)
+summary(xgbc)
+print(xgbc)
+
+pred_y <- predict(xgbc, newdata = xgb_test)
+
+mse <- mean((as.numeric(as.character(test_y)) - pred_y) ^ 2)
+mae <- MAE(as.numeric(as.character(test_y)), pred_y)
+rmse <- RMSE(as.numeric(as.character(test_y)), pred_y)
+
+x = 1:length(as.numeric(as.character(test_y)))
+{plot(x, as.numeric(as.character(test_y)), col = "red", type = "l")
+lines(x, pred_y, col = "blue", type = "l")
+legend(x = 1, y = 38,  legend = c("original test_y", "predicted test_y"), 
+       col = c("red", "blue"), box.lty = 1, cex = 0.8, lty = c(1, 1))}
+
+quantile(pred_y, c(0.25, .5, 0.75, 0.85, 0.9, 0.95))
+xgbpred_factors <- ifelse(pred_y > 0.25, 1, 0)
+xgbpred_factors <- as.factor(xgbpred_factors)
+
+confusionMatrix(xgbpred_factors, test_y) #gets almost every single missed goal correct, but struggles with predicting goals?
+#######################
+test_x_df <- as.data.frame(test_x)
+preds <- as.data.frame(pred_y)
+test_x_df$pred <- preds
+test_x_df <- test_x_df %>%
+  mutate(xG = (as.numeric(unlist(preds)))) %>%
+  dplyr::select(Event_tm_skaters:Skate_diff, xG)
+```
+
+```{r}
+mid_point <- mean(test_x_df$xG)
+
+test_x_df %>%
+  rink() +
+  geom_point(aes(x = X.Coordinate, y = Y.Coordinate, color = xG), size = 3) +
+  scale_color_gradient(low = "white", high = "red") +
+  labs(caption = "Ben Howell | @benhowell71 | benhowell71.com") + 
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 16))
+  # scale_color_gradient2(low = "blue", mid = "beige", midpoint = 0.2, high = "red") +
+  # theme_minimal()
+
+test_x_df %>%
+  rink() +
+  stat_summary_hex(aes(x = X.Coordinate, y = Y.Coordinate, z = xG),
+                   fun = mean, binwidth = c(5, 5)) +
+  scale_fill_gradient2(low = "lightblue", mid = "white", midpoint = 0.1, high = "red") +
+  theme_minimal() +
+  labs(title = "Average xG by Shot Location",
+       caption = "Ben Howell | @benhowell71 | benhowell71.com",
+       subtitle = "Trained on NWHL data. Tested on Olympic data",
+       fill = "Avg xG") +
+  geom_path(data = goal, aes(x = goal_x - 100, y = goal_y - 42.5), size = 2) +
+  theme(panel.grid = element_blank(), 
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+        plot.caption = element_text(hjust = 0.5, face = "italic", size = 10),
+        plot.subtitle = element_text(hjust = 0.5))
+
+import <- xgb.importance(model = xgbc)
+xgb.ggplot.importance(importance_matrix = import) +
+  theme_minimal() +
+  labs(caption = "Ben Howell | @benhowell71 | benhowell71.com") + 
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 16))
+#Detail 1 = shottype
+#Detail 2 = location (on net or missed)
+#Traffic
+#one timer
+```
+
+```{r}
+train <- train_games %>%
+  filter(! Event %in% c("Shot", "Goal") | Detail.2 == "Blocked") %>%
+  mutate(xG = 0)
+
+test <- test_games %>%
+  filter(! Event %in% c("Shot", "Goal") | Detail.2 == "Blocked") %>% #rest of events in tran/test games
+  mutate(xG = 0)
+  
+train_shots_context <- train_games %>%
+  filter(Event %in% c("Shot", "Goal") & Detail.2 != "Blocked") %>%
+  dplyr::select(-Event_tm_skaters, -Opponent_tm_skaters, -min_of_play, -X.Coordinate, -Y.Coordinate, 
+                -Detail.1, -Detail.2, -Detail.3, -Detail.4, -Skate_diff, -label)
+
+test_shots_context <- test_games %>%
+  filter(Event %in% c("Shot", "Goal") & Detail.2 != "Blocked") %>%
+  dplyr::select(-Event_tm_skaters, -Opponent_tm_skaters, -min_of_play, -X.Coordinate, -Y.Coordinate, 
+                -Detail.1, -Detail.2, -Detail.3, -Detail.4, -Skate_diff, label)
+
+level_1 <- levels(data$Detail.1)
+level_2 <- levels(data$Detail.2)
+level_3 <- levels(data$Detail.3)
+level_4 <- levels(data$Detail.4)
+
+det_one <- as.data.frame(level_1) %>%
+  mutate(One_factor = row_number(),
+         Detail.1 = paste(level_1)) %>%
+  dplyr::select(-level_1)
+
+det_two <- as.data.frame(level_2) %>%
+  mutate(Two_factor = row_number(),
+         Detail.2 = paste(level_2)) %>%
+  dplyr::select(-level_2)
+
+det_three <- as.data.frame(level_3) %>%
+  mutate(Three_factor = row_number(),
+         Detail.3 = paste(level_3)) %>%
+  dplyr::select(-level_3)
+
+det_four <- as.data.frame(level_4) %>%
+  mutate(Four_factor = row_number(),
+         Detail.4 = paste(level_4)) %>%
+  dplyr::select(-level_4)
+
+test_shots_context$Event_tm_skaters <- test_x_df$Event_tm_skaters
+test_shots_context$Opponent_tm_skaters <- test_x_df$Opponent_tm_skaters
+test_shots_context$min_of_play <- test_x_df$min_of_play
+test_shots_context$X.Coordinate <- test_x_df$X.Coordinate
+test_shots_context$Y.Coordinate <- test_x_df$Y.Coordinate
+test_shots_context$Detail.1_fac <- test_x_df$Detail.1
+test_shots_context$Detail.2_fac <- test_x_df$Detail.2
+test_shots_context$Detail.3_fac <- test_x_df$Detail.3
+test_shots_context$Detail.4_fac <- test_x_df$Detail.4
+test_shots_context$Skate_diff <- test_x_df$Skate_diff
+test_shots_context$xG <- test_x_df$xG
+
+test_shots_context <- right_join(test_shots_context, det_one, by = c("Detail.1_fac" = "One_factor"))
+test_shots_context <- right_join(test_shots_context, det_two, by = c("Detail.2_fac" = "Two_factor"))
+test_shots_context <- right_join(test_shots_context, det_three, by = c("Detail.3_fac" = "Three_factor"))
+test_shots_context <- right_join(test_shots_context, det_four, by = c("Detail.4_fac" = "Four_factor"))
+
+test_shots_context <- test_shots_context %>%
+  dplyr::select(-Detail.1_fac, -Detail.2_fac, -Detail.3_fac, -Detail.4_fac)
+
+test_df <- rbind(test, test_shots_context) %>%
+  filter(!is.na(game_date))
+
+test_df <- test_df %>%
+  arrange(Play_event)
+```
+
+
+```{r}
+#running xG back on the training dataset
+set.seed(22)
+pred_x <- predict(xgbc, newdata = xgb_train)
+
+train_x_df <- as.data.frame(train_x)
+preds_x <- as.data.frame(pred_x)
+train_x_df$pred <- preds_x
+train_x_df <- train_x_df %>%
+  mutate(xG = (as.numeric(unlist(preds_x)))) %>%
+  dplyr::select(Event_tm_skaters:Skate_diff, xG)
+
+train_shots_context <- train_shots_context %>%
+  filter(! is.na(game_date))
+
+train_shots_context$Event_tm_skaters <- train_x_df$Event_tm_skaters
+train_shots_context$Opponent_tm_skaters <- train_x_df$Opponent_tm_skaters
+train_shots_context$min_of_play <- train_x_df$min_of_play
+train_shots_context$X.Coordinate <- train_x_df$X.Coordinate
+train_shots_context$Y.Coordinate <- train_x_df$Y.Coordinate
+train_shots_context$Detail.1_fac <- train_x_df$Detail.1
+train_shots_context$Detail.2_fac <- train_x_df$Detail.2
+train_shots_context$Detail.3_fac <- train_x_df$Detail.3
+train_shots_context$Detail.4_fac <- train_x_df$Detail.4
+train_shots_context$Skate_diff <- train_x_df$Skate_diff
+train_shots_context$xG <- train_x_df$xG
+
+train_shots_context <- right_join(train_shots_context, det_one, by = c("Detail.1_fac" = "One_factor"))
+train_shots_context <- right_join(train_shots_context, det_two, by = c("Detail.2_fac" = "Two_factor"))
+train_shots_context <- right_join(train_shots_context, det_three, by = c("Detail.3_fac" = "Three_factor"))
+train_shots_context <- right_join(train_shots_context, det_four, by = c("Detail.4_fac" = "Four_factor"))
+
+train_shots_context <- train_shots_context %>%
+  dplyr::select(-Detail.1_fac, -Detail.2_fac, -Detail.3_fac, -Detail.4_fac)
+
+train_shots_context <- train_shots_context %>%
+  filter(! is.na(game_date)) %>%
+  mutate(label = ifelse(Event == "Goal", 1, 0))
+
+train_df <- rbind(train, train_shots_context) %>%
+  filter(!is.na(game_date))
+
+train_df <- train_df %>%
+  arrange(Play_event)
+
+test_df <- rbind(test_df, train_df)
+```
+
+as reference: https://karun.in/blog/expected-threat.html
+- divide the rink into zones
+  + essentially a 200 x 85 rink
+- start with worth 0 for all zones and pass types, then evaluate formula **iteratively until convergence**
+  + can then evaluate the formula based on xV from previous iteration
+
+# Rink Stuff
+
+```{r}
+######
+xbreaks <- seq(-100.01, 100.01, length.out = 11)
+#goes from -100.01 to 100.01 to properly account values at 100 or -100
+ybreaks <- seq(-42.6, 42.6, length.out = 8)
+#goes from -42.6 to 42.6 to properly account values at 42.5 or -42.5
+
+id <- matrix(seq_len(length(xbreaks) * length(ybreaks)),
+             length(xbreaks), length(ybreaks))
+
+xi <- findInterval(data$X.Coordinate, xbreaks)
+yi <- findInterval(data$Y.Coordinate, ybreaks)
+
+data$id <- id[cbind(xi, yi)]
+
+x2 <- findInterval(data$X.Coordinate.2, xbreaks)
+y2 <- findInterval(data$Y.Coordinate.2, ybreaks)
+
+data$id_two <- id[cbind(x2, y2)]
+
+###########needed for later as graphing references
+xbrk <- seq(-90, 90, length.out = 10)
+ybrk <- seq(-36.43, 36.43, length.out = 7)
+
+points <- merge(xbrk, ybrk)
+
+x_p <- findInterval(points$x, xbreaks)
+y_p <- findInterval(points$y, ybreaks)
+
+points$id <- id[cbind(x_p, y_p)]
+
+points <- points %>%
+  mutate(x_min = x - 10, 
+         x_max = x + 10, 
+         y_min = y - 6.07,
+         y_max = y + 6.07)
+
+data <- data %>%
+  ungroup() %>%
+  group_by(Play_event) %>%
+  mutate(next_zone = lead(id),
+         zone_next = ifelse(is.na(next_zone), id_two, next_zone))
+  #so, for unsuccessful passes, we take the intended location or zone
+  #allows measuring how successful passes b/t zones are
+  #though, when we measure for xAV, unsuccessful passes receive a value of 0
+  #but that's a bridge to cross when we get there
+#
+```
+
+```{r}
+#Zone, AVzone, Movement%
+zone <- data %>%
+  filter(Event %in% c("Goal", "Shot", "Play", "Incomplete Play")) %>%
+  #not considering dump in/outs b/c intentionally conceding possession
+  group_by(id) %>%
+  count(Event) %>%
+  spread(Event, n, fill = 0) %>%
+  mutate(Events = Goal + `Incomplete Play` + Shot + Play,
+         Shots = Goal + Shot,
+         #creating separate shots variable makes shooting% calculation easier
+         Shot_pct = round(Shots / Events, digits = 3),
+         Move_pct = round((`Incomplete Play` + Play) / Events, digits = 3),
+         #Shot_pct + Move_pct should equal 1
+         Make_pct = round(Goal / Shots, digits = 3),
+         Make_pct = ifelse(Make_pct == "NaN", 0, Make_pct),
+         #cleaning up the Make_pct variable so that we have 0s instead of NaNs
+         AVxy = round(Shot_pct * Make_pct, digits = 5)) %>%
+  dplyr::select(id, Shot_pct, Make_pct, Move_pct)
+```
+
+```{r}
+#movement between zones
+movement <- data %>%
+  filter(Event %in% c("Goal", "Shot", "Play", "Incomplete Play")) %>%
+  #not considering dump in/outs b/c intentionally conceding possession
+  group_by(id) %>%
+  count(zone_next) %>%
+  #using zone_next b/c it accounts for turnovers
+  #since we want to know how often someone tries to pass from Zone X to Zone Y
+  #knowing where they were aimed helps, even if the pass was taken away
+  filter(! is.na(zone_next))
+
+obs <- data %>%
+  filter(! is.na(zone_next)) %>%
+  ungroup() %>%
+  count(id) %>%
+  mutate(Obs = n) %>%
+  dplyr::select(-n)
+
+movement <- right_join(movement, obs, by = c("id"))
+#enables us to find out how often someone went from Zone id to the next zone
+#essentially: movement / total movements from that zone
+
+movement <- movement %>%
+  mutate(pct_of_moves = round(n / Obs, digits = 5)) %>%
+  dplyr::select(id, zone_next, pct_of_moves)
+```
+
+```{r}
+success <- data %>%
+  filter(Event %in% c("Goal", "Shot", "Play", "Incomplete Play")) %>%
+  #not considering dump in/outs b/c intentionally conceding possession
+  group_by(id, zone_next) %>%
+  count(change_poss) %>%
+  filter(! is.na(zone_next)) %>%
+  spread(change_poss, n, fill = 0) %>%
+  mutate(Passes = `No Change` + Turnover,
+         Success_pct = round(`No Change` / Passes, digits = 5)) %>%
+  dplyr::select(id, zone_next, Success_pct)
+
+nrow(movement) == nrow(success)
+#should be true
+```
+
+```{r}
+movement <- right_join(movement, success, by = c("id", "zone_next"))
+
+all <- right_join(movement, zone, by = c("id"))
+
+zw <- zone %>%
+  #this will give us the AVzw for iteration two
+  #iteration 1 was a simple shot * make
+  rename(c("zone_next" = "id",
+           "zw_shot_pct" = "Shot_pct",
+           "zw_make_pct" = "Make_pct")) %>%
+  dplyr::select(-Move_pct)
+
+all <- right_join(all, zw, by = c("zone_next"))
+```
+
+```{r}
+it_two <- all %>%
+  mutate(AVzw = zw_shot_pct * zw_make_pct,
+         move_score = Success_pct * pct_of_moves,
+         value = move_score * AVzw)
+
+score <- it_two %>%
+  group_by(id) %>%
+  #sum of scores from zone that you are in
+  summarise(SUM_VAL = sum(value))
+
+total <- right_join(zone, score, by = c("id"))
+
+total <- total %>%
+  mutate(xAVxy_one = round((Shot_pct * Make_pct) +
+                      (Move_pct * SUM_VAL), digits = 4))
+```
+
+### Next Iteration
+
+```{r}
+constants <- it_two %>%
+  dplyr::select(id, zone_next, Shot_pct, Make_pct, Move_pct, move_score)
+#need to add in xAVxy from above as xAVzw
+#i.e. evaluate in iterations
+one_res <- total %>%
+  dplyr::select(id, xAVxy_one) %>%
+  rename(c("AVzw" = "xAVxy_one",
+           "zone_next" = "id"))
+
+it_three <- right_join(constants, one_res, by = c("zone_next"))
+
+it_three <- it_three %>%
+  mutate(value = move_score * AVzw)
+
+score_three <- it_three %>%
+  group_by(id) %>%
+  summarise(SUM_VAL = sum(value)) %>%
+  right_join(zone, by = c("id")) %>%
+  mutate(AV_two = round((Shot_pct * Make_pct) +
+                      (Move_pct * SUM_VAL), digits = 4))
+```
+
+### Fourth Iteration
+
+```{r}
+three_res <- score_three %>%
+  dplyr::select(id, AV_two) %>%
+  rename(c("AVzw" = "AV_two",
+           "zone_next" = "id"))
+
+it_four <- right_join(constants, three_res, by = c("zone_next"))
+
+it_four <- it_four %>%
+  mutate(value = move_score * AVzw)
+
+score_four <- it_four %>%
+  group_by(id) %>%
+  summarise(SUM_VAL = sum(value)) %>%
+  right_join(zone, by = c("id")) %>%
+  mutate(AV_four = round((Shot_pct * Make_pct) +
+                      (Move_pct * SUM_VAL), digits = 4))
+```
+
+### Fifth Iteration
+
+```{r}
+four_res <- score_four %>%
+  dplyr::select(id, AV_four) %>%
+  rename(c("AVzw" = "AV_four",
+           "zone_next" = "id"))
+
+it_five <- right_join(constants, four_res, by = c("zone_next"))
+
+it_five <- it_five %>%
+  mutate(value = move_score * AVzw)
+
+score_five <- it_five %>%
+  group_by(id) %>%
+  summarise(SUM_VAL = sum(value)) %>%
+  right_join(zone, by = c("id")) %>%
+  mutate(AV_five = round((Shot_pct * Make_pct) +
+                      (Move_pct * SUM_VAL), digits = 4))
+```
+
+```{r}
+results <- score_five %>%
+  dplyr::select(id, AV_five) %>%
+  rename(c("xAV" = "AV_five")) %>%
+  right_join(points, by = c("id"))
+#wow! Zones right in front of the goal have the highest xAV
+```
+
+```{r}
+med <- median(results$xAV)
+
+results %>%
+  ggplot() +
+  geom_rect(aes(xmin = x_min, xmax = x_max, ymin = y_min, ymax = y_max, color = xAV, fill = xAV)) +
+  scale_color_gradient2(low = "lightblue", mid = "white", midpoint = med, high = "red") +
+  scale_fill_gradient2(low = "lightblue", mid = "white", midpoint = med, high = "red")  +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.text = element_blank(),
+        axis.title = element_blank())  +
+  geom_segment(aes(x = 25 - 100, xend = 175 - 100, y = 0 - 42.5, yend = 0 - 42.5)) +
+  geom_segment(aes(x = 25 - 100, xend = 175 - 100, y = 85 - 42.5, yend = 85 - 42.5)) +
+  geom_segment(aes(x = 0 - 100, xend = 0 - 100, y = 20 - 42.5, yend = 60 - 42.5)) +
+  geom_segment(aes(x = 200 - 100, xend = 200 - 100, y = 20 - 42.5, yend = 60 - 42.5)) +
+  geom_curve(aes(x = 0 - 100, xend = 25 - 100, y = 60 - 42.5, yend = 85 - 42.5),
+             curvature = -0.32) +
+  geom_curve(aes(x = 0 - 100, xend = 25 - 100, y = 20 - 42.5, yend = 0 - 42.5),
+             curvature = 0.32) +
+  geom_curve(aes(x = 175 - 100, xend = 200 - 100, y = 0 - 42.5, yend = 20 - 42.5),
+             curvature = 0.32) +
+  geom_curve(aes(x = 175 - 100, xend = 200 -100, y = 85 - 42.5, yend = 60 - 42.5),
+             curvature = -0.32)  +
+  geom_path(data = goal, aes(x = goal_x - 100, y = goal_y - 42.5)) +
+  geom_segment(aes(x = 100 - 100, xend = 100 - 100, y = 85 - 42.5, yend = 0 - 42.5), size = 2, color = "red")  +
+  labs(title = "Average xAV by Location",
+       caption = "Ben Howell | @benhowell71 | benhowell71.com",
+       fill = "xAV") +
+  geom_path(data = goal, aes(x = goal_x - 100, y = goal_y - 42.5), size = 2) +
+  theme(panel.grid = element_blank(), 
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+        plot.caption = element_text(hjust = 0.5, face = "italic", size = 10),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+```{r}
+#need to look carefully at this to make sure that credit is being properly assigned
+#where a takeaway occurs, xAVzw == 0, make that a negative action
+#where a goal is taken, should be xAVxy (quality of shot)
+# zone_score <- results %>%
+#   dplyr::select(id, xAV) %>%
+#   rename(c("xAVxy" = "xAV"))
+# 
+# data <- right_join(data, zone_score, by = c("id"))
+# 
+# zone_score2 <- results %>%
+#   dplyr::select(id, xAV) %>%
+#   rename(c("xAVzw" = "xAV"))
+# 
+# use_data <- data %>%
+#   filter(Event %in% c("Goal", "Shot", "Play", "Incomplete Play") & ! is.na(zone_next))
+# 
+# use_data <- right_join(data, zone_score2, by = c("zone_next" = "id"))
+```
+
+```{r}
+zone_score <- results %>%
+  dplyr::select(id, xAV) %>%
+  rename(c("xAVxy" = "xAV"))
+#the value of each zone
+
+data <- right_join(data, zone_score, by = c("id"))
+#now, every action has a specific value
+#we'll again filter out actions that we're interested in where stuff happens
+#penatlies, dump in/outs, puck recovery, zone entries are not things we're interested in
+#we don't take takeaways either b/c they're recorded as their own event
+
+data_score <- data %>%
+  filter(Event %in% c("Goal", "Incomplete Play", "Play", "Shot"))
+
+#incomplete plays are unsuccessful
+#so are plays that result in a "Turnover" according to our change_poss variable
+#for these, we want 0 as the next value so those passes register w/ negative value
+
+zone_score2 <- results %>%
+  dplyr::select(id, xAV) %>%
+  rename(c("xAVzw" = "xAV",
+           "next_zone" = "id"))
+
+# test <- data_score %>%
+#   filter(is.na(next_zone)) %>%
+#   ungroup() %>%
+#   count(Event)
+
+data_score <- merge(data_score, zone_score2, by = "next_zone", all = TRUE, incomparables = 0)
+zone_scorena <- results %>%
+  dplyr::select(id, xAV) %>%
+  rename(c("xAVzw_na" = "xAV",
+           "id_two" = "id"))
+
+data_score <- merge(data_score, zone_scorena, by = "id_two", all = TRUE, incomparables = 0)
+
+data_score <- data_score %>%
+  ungroup() %>%
+  mutate(xAVzw = ifelse(Event %in% c("Shot", "Goal"), NA, 
+                        ifelse(change_poss == "Turnover" | Event == "Incomplete Play", 0, 
+                               ifelse(is.na(xAVzw) & (Event == "Play" & change_poss != "Turnover"), xAVzw_na,
+                                      xAVzw))), 
+         xAV = ifelse(Event %in% c("Shot", "Goal"), xAVxy, xAVzw - xAVxy)) %>%
+  dplyr::select(game_date, Team:League, change_poss, id, next_zone, id_two, zone_next, xAVxy:xAV)
+```
+
+```{r}
+test <- data_score %>%
+  filter(is.na(xAV)) #should be 0 rows now
+nrow(test) == 0
+
+leaders <- data_score %>%
+  group_by(League, Team, Player) %>%
+  summarise(xAV = sum(xAV), 
+            Events = n(),
+            xAV_100 = (xAV / Events)*100) 
+
+rlead <- data %>%
+  group_by(League, Team, Player) %>%
+  count(Event) %>%
+  spread(Event, n, fill = 0) %>%
+  mutate(`Shot%` = round(((Shot + Goal) / (Shot + Goal + Play + `Incomplete Play` + `Dump In/Out`))*100)) %>%
+  #look at frequency of shots
+  dplyr::select(League:Player, Shot, Goal, `Shot%`)
+
+all_lead <- merge(leaders, rlead, all = TRUE)
+
+xglead <- test_df %>%
+  group_by(League, Team, Player) %>%
+  summarise(xG = sum(xG, na.rm = TRUE))
+
+all_lead <- merge(all_lead, xglead, all = TRUE)
+
+all_lead <- all_lead %>%
+  mutate(xg_100 = (xG / (Shot + Goal))*100)
+
+bdc <- all_lead %>%
+  filter(! is.na(xAV) & ! is.na(xG))
+
+cor_res <- round(cor(bdc$xAV, bdc$xG), digits = 3)
+
+write.csv(all_lead, file = "leaders.csv", row.names = FALSE)
+
+all_lead %>%
+  ggplot() +
+  geom_point(aes(x = xAV, y = xG, color = `Shot%`)) +
+  scale_color_gradient(low = "white", high = "purple") +
+  #geom_text_repel(data = subset(all_lead, xAV >= 1.5 | xG >= 3), 
+   #               aes(x = xAV, y = xG, label = Player, color = League)) +
+  geom_smooth(aes(x = xAV, y = xG)) +
+  #geom_abline(slope = 1.75)
+  theme_minimal() +
+  labs(title = "xG vs xAV",
+       subtitle = paste0("Correlation: ", cor_res)) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+        plot.caption = element_text(hjust = 0.5, face = "italic", size = 10),
+        plot.subtitle = element_text(hjust = 0.5),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(color = "lightgrey", fill = "lightgrey"))
+```
+
+### Mixture Model for pass clustering
+
+```{r}
+passes <- data %>%
+  filter(Event %in% c("Play", "Incomplete Play")) %>%
+  #ignores dump in/outs  b/c tgey are a concession of possession
+  mutate(X.Coordinate = ifelse(X.Coordinate == X.Coordinate.2, X.Coordinate + 0.001, X.Coordinate),
+         Direction = (Y.Coordinate.2 - Y.Coordinate) / (X.Coordinate.2 - X.Coordinate),
+         Length = sqrt(((X.Coordinate.2 - X.Coordinate) ^ 2) + ((Y.Coordinate.2 - Y.Coordinate) ^ 2))) #this way we don't have NAs
+
+direct_passes <- passes %>%
+  ungroup() %>%
+  filter(Detail.1 == "Direct") %>%
+  mutate(Pass_type = ifelse(Detail.1 == "Direct", 0, 1),
+         Pass_type = as.factor(Pass_type)) %>%
+  dplyr::select(X.Coordinate, X.Coordinate.2, Y.Coordinate, Y.Coordinate.2,
+                Direction, Length)
+
+indirect_passes <- passes %>%
+  ungroup() %>%
+  filter(Detail.1 == "Indirect") %>%
+  mutate(Pass_type = ifelse(Detail.1 == "Direct", 0, 1),
+         Pass_type = as.factor(Pass_type)) %>%
+  dplyr::select(X.Coordinate, X.Coordinate.2, Y.Coordinate, Y.Coordinate.2,
+                Direction, Length)
+```
+
+```{r}
+#####Gaussian for Direct Passes
+set.seed(363)
+direct_mm <- Mclust(direct_passes)
+summary(direct_mm) #still 9 passes!
+summary(direct_mm$BIC)
+
+# get cluster centers
+direct_centers <- direct_mm$parameters$mean %>%
+  t() %>%
+  as.data.frame()
+
+# name clusters
+direct_centers$Cluster <- c('Cluster 1', 'Cluster 2', 'Cluster 3',
+                       'Cluster 4', 'Cluster 5', "Cluster 6",
+                       "Cluster 7", "Cluster 8", "Cluster 9") 
+
+direct_preds <- as.data.frame(predict(direct_mm, direct_passes))
+direct_augment <- augment(direct_mm, direct_passes)
+
+direct_augment %>%
+  rink() +
+  geom_segment(aes(x = X.Coordinate, xend = X.Coordinate.2,
+                   y = Y.Coordinate, yend = Y.Coordinate.2, color = .class)) +
+  geom_point(aes(x = X.Coordinate, y = Y.Coordinate)) + #using X.Coordinate is where the pass was released from
+  facet_wrap(~.class) +
+  theme_minimal()
+```
+```{r}
+###########Gaussian for Indirect Passes
+set.seed(365)
+indirect_mm <- Mclust(indirect_passes)
+summary(indirect_mm) #down to 8 passes
+
+# get cluster centers
+indirect_centers <- indirect_mm$parameters$mean %>%
+  t() %>%
+  as.data.frame()
+
+# name clusters
+indirect_centers$Cluster <- c('Cluster 1', 'Cluster 2', 'Cluster 3',
+                       'Cluster 4', 'Cluster 5', "Cluster 6", "Cluster 7", "Cluster 8") 
+
+indirect_preds <- as.data.frame(predict(indirect_mm, indirect_passes))
+indirect_augment <- augment(indirect_mm, indirect_passes)
+
+indirect_passes2 <- passes %>%
+  ungroup() %>%
+  filter(Detail.1 == "Indirect") %>%
+  mutate(Pass_type = ifelse(Detail.1 == "Direct", 0, 1),
+         Pass_type = as.factor(Pass_type))
+
+indirect_passes2$Cluster <- indirect_augment$.class
+
+
+direct_passes2 <- passes %>%
+  ungroup() %>%
+  filter(Detail.1 == "Direct") %>%
+  mutate(Pass_type = ifelse(Detail.1 == "Direct", 0, 1),
+         Pass_type = as.factor(Pass_type))
+
+direct_passes2$Cluster <- direct_augment$.class
+
+pass_w_cluster <- rbind(direct_passes2, indirect_passes2) %>%
+  mutate(xG = NA)
+
+non_passes <- data %>%
+  filter(! Event %in% c("Play", "Incomplete Play", "Shot", "Goal")) %>%
+  #ignores dump in/outs  b/c tgey are a concession of possession
+  mutate(X.Coordinate = NA,
+         Direction = NA,
+         Length = NA,
+         Cluster = NA, 
+         Pass_type = NA,
+         xG = NA)
+
+all_data_w_cluster <- rbind(non_passes, pass_w_cluster)
+
+all_data_w_cluster <- all_data_w_cluster %>%
+  arrange(desc(Play_event))
+
+df <- as.data.frame(all_data_w_cluster)
+
+write.csv(non_passes, file = "non_passes_shots.csv", row.names = FALSE)
+write.csv(pass_w_cluster, file = "pass_cluster.csv", row.names = FALSE)
+
+shots <- data %>%
+  filter(Event %in% c("Shot", "Goal")) %>%
+  #ignores dump in/outs  b/c tgey are a concession of possession
+  mutate(X.Coordinate = NA,
+         Direction = NA,
+         Length = NA,
+         Cluster = NA, 
+         Pass_type = NA) %>%
+  arrange(desc(row_num))
+
+xg_shots <- test_df %>%
+  filter(Event %in% c("Shot", "Goal")) %>%
+  arrange(desc(row_num))
+
+shots$xG <- xg_shots$xG
+
+write.csv(shots, file = "shots.csv", row.names = FALSE)
+
+indirect_augment %>%
+  rink() +
+  geom_segment(aes(x = X.Coordinate, xend = X.Coordinate.2,
+                   y = Y.Coordinate, yend = Y.Coordinate.2, color = .class)) +
+  geom_point(aes(x = X.Coordinate, y = Y.Coordinate)) + #using X.Coordinate is where the pass was released from
+  facet_wrap(~.class)
+```
+
