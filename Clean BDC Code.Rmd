@@ -12,9 +12,6 @@ knitr::opts_chunk$set(echo = FALSE,
                       fig.align = "center")
 ```
 
-Event %in% c("Faceoff Win", "Takeaway", "Puck Recovery") for events that start a possession w/ row_number
-1:18:00 moodboards stream: https://www.twitch.tv/videos/902736929
-
 ```{r Load/Manipulate Data}
 library(tidyverse)
 library(grid)
@@ -327,7 +324,6 @@ test_df <- test_df %>%
   arrange(Play_event)
 ```
 
-
 ```{r}
 #running xG back on the training dataset
 set.seed(22)
@@ -375,12 +371,6 @@ train_df <- train_df %>%
 
 test_df <- rbind(test_df, train_df)
 ```
-
-as reference: https://karun.in/blog/expected-threat.html
-- divide the rink into zones
-  + essentially a 200 x 85 rink
-- start with worth 0 for all zones and pass types, then evaluate formula **iteratively until convergence**
-  + can then evaluate the formula based on xV from previous iteration
 
 # Rink Stuff
 
@@ -646,26 +636,6 @@ results %>%
 ```
 
 ```{r}
-#need to look carefully at this to make sure that credit is being properly assigned
-#where a takeaway occurs, xAVzw == 0, make that a negative action
-#where a goal is taken, should be xAVxy (quality of shot)
-# zone_score <- results %>%
-#   dplyr::select(id, xAV) %>%
-#   rename(c("xAVxy" = "xAV"))
-# 
-# data <- right_join(data, zone_score, by = c("id"))
-# 
-# zone_score2 <- results %>%
-#   dplyr::select(id, xAV) %>%
-#   rename(c("xAVzw" = "xAV"))
-# 
-# use_data <- data %>%
-#   filter(Event %in% c("Goal", "Shot", "Play", "Incomplete Play") & ! is.na(zone_next))
-# 
-# use_data <- right_join(data, zone_score2, by = c("zone_next" = "id"))
-```
-
-```{r}
 zone_score <- results %>%
   dplyr::select(id, xAV) %>%
   rename(c("xAVxy" = "xAV"))
@@ -688,11 +658,6 @@ zone_score2 <- results %>%
   dplyr::select(id, xAV) %>%
   rename(c("xAVzw" = "xAV",
            "next_zone" = "id"))
-
-# test <- data_score %>%
-#   filter(is.na(next_zone)) %>%
-#   ungroup() %>%
-#   count(Event)
 
 data_score <- merge(data_score, zone_score2, by = "next_zone", all = TRUE, incomparables = 0)
 zone_scorena <- results %>%
