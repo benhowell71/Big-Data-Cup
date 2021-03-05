@@ -1,0 +1,492 @@
+---
+title: "**How Do We Get There: Quantifying Pass Types and their Value**"
+author: |
+ |
+ | Ben Howell, University of Texas at Austin
+ | Big Data Cup 2021
+ |
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: 
+  pdf_document:
+    fig_caption: false
+geometry: margin=0.9in
+fontsize: 12pt
+classoption: fleqn
+header-includes: 
+ - \setlength{\mathindent}{0pt}
+ - \setlength{\parindent}{0pt}
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, 
+                      warning = FALSE, 
+                      message = FALSE,
+                      fig.align = "center")
+```
+
+```{r}
+library(tidyverse)
+library(kableExtra)
+
+shots <- read.csv("shots.csv")
+non_passes <- read.csv("non_passes_shots.csv")
+passes <- read.csv("pass_cluster.csv")
+leaders <- read.csv("leaders.csv") %>%
+  mutate(shot_pct = Shot.,
+         xAV = round(xAV, digits = 2),
+         `xAV_100` = round(xAV_100, digits = 2),
+         xG = round(xG, digits = 2),
+         `xg_100` = round(xg_100, digits = 2)) %>%
+  dplyr::select(-Shot.)
+
+data <- rbind(shots, non_passes, passes) %>%
+  arrange(row_num)
+
+results <- read.csv("results.csv")
+
+goal_x <- c(188, 190, 190, 188)
+goal_y <- c(40, 40, 45, 45)
+
+goal <- data.frame(goal_x, goal_y)
+
+rink <- function(...) {
+  ggplot(...)  +
+  geom_segment(aes(x = 25 - 100, xend = 175 - 100, y = 0 - 42.5, yend = 0 - 42.5)) +
+  geom_segment(aes(x = 25 - 100, xend = 175 - 100, y = 85 - 42.5, yend = 85 - 42.5)) +
+  geom_segment(aes(x = 0 - 100, xend = 0 - 100, y = 20 - 42.5, yend = 60 - 42.5)) +
+  geom_segment(aes(x = 200 - 100, xend = 200 - 100, y = 20 - 42.5, yend = 60 - 42.5)) +
+  geom_curve(aes(x = 0 - 100, xend = 25 - 100, y = 60 - 42.5, yend = 85 - 42.5),
+             curvature = -0.32) +
+  geom_curve(aes(x = 0 - 100, xend = 25 - 100, y = 20 - 42.5, yend = 0 - 42.5),
+             curvature = 0.32) +
+  geom_curve(aes(x = 175 - 100, xend = 200 - 100, y = 0 - 42.5, yend = 20 - 42.5),
+             curvature = 0.32) +
+  geom_curve(aes(x = 175 - 100, xend = 200 -100, y = 85 - 42.5, yend = 60 - 42.5),
+             curvature = -0.32)  +
+  geom_path(data = goal, aes(x = goal_x - 100, y = goal_y - 42.5)) +
+  geom_segment(aes(x = 100 - 100, xend = 100 - 100, y = 85 - 42.5, yend = 0 - 42.5), size = 2, color = "red")
+}
+
+#the goal is at 90, 0
+
+zone_score2 <- results %>%
+  dplyr::select(id, xAV) %>%
+  rename(c("xAVzw" = "xAV",
+           "next_zone" = "id"))
+
+zone_scorena <- results %>%
+  dplyr::select(id, xAV) %>%
+  rename(c("xAVzw_na" = "xAV",
+           "id_two" = "id"))
+
+data <- data %>%
+  mutate(dist_to_goal = round(sqrt((90 - X.Coordinate)^2 + (0 - Y.Coordinate)^2), digits = 2),
+         dist_of_result = round(sqrt((90 - X.Coordinate.2)^2 + (0 - Y.Coordinate.2)^2), digits = 2),
+         diff = dist_of_result / dist_to_goal,
+         progressive_pass = ifelse(diff <= 0.75, "Yes",
+                                   ifelse(diff > 0.75, "No", NA))) %>%
+  merge(zone_score2, by = "next_zone", all = TRUE, incomparables = 0) %>%
+  merge(zone_scorena, by = "id_two", all = TRUE, incomparables = 0) %>%
+  ungroup() %>%
+  mutate(xAVzw = ifelse(Event %in% c("Shot", "Goal"), NA, 
+                        ifelse(change_poss == "Turnover" | Event == "Incomplete Play", 0, 
+                               ifelse(is.na(xAVzw) & (Event == "Play" & change_poss != "Turnover"), xAVzw_na,
+                                      xAVzw))), 
+         xAV = ifelse(Event %in% c("Shot", "Goal"), xAVxy, xAVzw - xAVxy))
+
+# leaders_two <- data %>%
+#   filter(Event %in% c("Goal", "Incomplete Play", "Play", "Shot")) %>%
+#   group_by(League, Team, Player) %>%
+#   summarise(xAV = sum(xAV), 
+#             Events = n(),
+#             xAV_100 = (xAV / Events)*100) 
+
+```
+
+![Expected Attack Value by Zone](Images/title_pic.jpeg)
+
+\newpage
+
+# Introduction
+
+This project focuses on measuring the value of an action taken by a team with regards to how it affects (positively or negatively) their chance of scoring. Hockey is unique with the idea of *hockey assists*, rewarding up to two players for their contribution to a goal. Basketball and soccer assign assists, but only to one player who passed to the shooter. The chess moves to set up a good shot are always occurring and the pass right before a shot is not necessarily the most important action in that sequence.               
+
+In this project, I define *Expected Attack Value (xAV)* as the value of every pass, movement, or shot based on how an action sets up future actions. The data has been provided by Stathletes for the 2021 Big Data Cup, containing 2018 Women's Olympic Tournament, NCAA, and 2021 NWHL bubble data. 
+
+This paper is heavily inspired two concepts from other sports: [*linear weights*](https://library.fangraphs.com/principles/linear-weights/) in baseball and Expected Threat (xT) analysis in soccer by [*Karun Singh*](https://karun.in/blog/expected-threat.html).
+
+In baseball, there are 24 out and on-base states, each with a distinct Run Expectancy. Bases loaded with 0 outs has a higher Run Expectancy than no one on, 2 outs. Events are valued by how they change the run expectancy, leading to Weighted On-Base Average (wOBA) and valuing a home run more than a single.                    
+
+This project's Expected Attack Value (xAV) is based on the idea that actions from different locations on the rink are worth more than others and attempts to assign every action (shot/pass/movement) a value.                
+
+The Karun Singh's soccer xT analysis provided a framework for my xAV formula and was crucial to taking this analysis from theoretical to a realized project.
+
+# Measuring the Value of an Action
+
+To make things manageable, I split up the hockey rink into a 10 x 7 grid, representing 70 zones. I then calculated xAV by zone, which then allows us to measure the value of moving from your current zone (x, y) to your next (z, w).
+
+The xAV of an action is defined in two parts: the chance of scoring a goal given a shot is taken (shot score) + movement (move score). The equation for calculating xAV of a zone is below.                     
+
+\makebox[\linewidth] {$xAV_{xy} = (s_{xy} * g_{xy}) + (m_{xy} * \sum_{x = 1}^{10} \sum_{y = 1}^{7} ((P_{xy -> zw} * T_{xy -> zw}) * xAV_{zw}))$}
+
+* (x, y) represents current/starting zone and (z, w) represents value of next zone
+* $xAV_{xy}$: Expected Attack Value of an action based on starting location (x, y)
+* $s_{xy}$: Probability of taking a shot from starting location
+* $g_{xy}$: Given a shot is taken, what is the probability of scoring a goal
+* $m_{xy}$: Probability of moving from a starting location ($s_{xy}$ + $m_{xy}$ = 1)
+* $P_{xy -> zw}$: Probability of a successful pass/movement from (x, y) location to (z, w) location
+* $T_{xy -> zw}$: Probability of moving from starting location to next location
+* $xAV_{zw}$: Expected Attack Value of next location              
+
+Calculating xAV is simple: if a shot is taken, the $xAV$ of the zone is your result; if it's a movement, you take the subtract $xAV_{zw}$ - $xAV_{xy}$ to get the value added of a movement.
+
+The shot score is essentially a simple xG model. Given the initial position of the player (noted by x, y), multiply the percent of actions from this zone that have been shots by the percentage of shots that result in goals from that zone. This returns a simple xG score for each zone. (An early version of this project built $xAV$ off xG from an `xgboost` model. You'll see the xG results later, but that plan was scrapped because the xG model took into account variables such as number of opposing skaters and I wanted to keep $xAV$ free of that influence.)                        
+
+The shot score of a location is then added to the movement score. The movement score represents the overall value that can be added by moving to a zone from your current one. The probability of moving from your current zone is represented by $m_{xy}$; $m_{xy}$ and $shot_{xy}$ should add to one, representing all possible actions from a zone.   
+
+The movement score represents the expected value that comes from moving to a specific zone. $T_{xy -> zw}$ is the probability of moving from the current zone (x, y) to another specific zone (z, w). I multiplied that by success% of actions from the current zone to the next zone, whether through a completed pass or skating without losing possession. Once I had that likelihood of successfully ending up in $zone_{zw}$ from $zone_{xy}$, I multiplied in the $xAV$ of the zone in question, giving us a *xAV* of moving from one zone to another.              
+
+To finish, I sum all $xAV$ of the potential zones that a player *could* move to from $zone_{xy}$. Multiplying back in $m_{xy}$ is the final step before we add back in the shot score.                       
+ 
+The movement score boils down to this: if a player chooses to move, which they do X% of the time from their starting point, players have moved to each zone (z, w) Y% of the time, with W% success, resulting in Z attack value.                     
+
+Getting this calculation started was the hardest part. The values of $s_{xy}$, $g_{xy}$, $m_{xy}$, $P_{xy -> zw}$, and $T_{xy -> zw}$ are constants. In our Big Data Cup dataset, players moved from Zone A to Zone B X% of the time, that never changes. But, we don't have an initial $xAV$ for the zones that we want to move to, which prevents us from running the formula, preventing us from getting $xAV$ per zone, and so on.           
+
+We have to **evaluate this formula in iterations, until the values converge** (this concept was introduced to me through Singh's soccer xT work). The first time we run this model, it produces a simple xG score for each zone. Once we have that, we can re-run the formula, using that new $xAV$ per zone that we just calculated as the new $xAV_{zw}$ for the next iteration of the model. I ran this formula five times until the $xAV$ per zone no longer changed with new iterations.                    
+
+Below is a visualization of *xAV* by zone. Unsurprisingly, the zones closest to the goal and in the offensive zone have the highest *xAV*, meaning that actions moving into those zones are worth the most.
+
+```{r}
+xbreaks <- seq(-100.01, 100.01, length.out = 11)
+#goes from -100.01 to 100.01 to properly account values at 100 or -100
+ybreaks <- seq(-42.6, 42.6, length.out = 8)
+#goes from -42.6 to 42.6 to properly account values at 42.5 or -42.5
+
+id <- matrix(seq_len(length(xbreaks) * length(ybreaks)),
+             length(xbreaks), length(ybreaks))
+
+xi <- findInterval(data$X.Coordinate, xbreaks)
+yi <- findInterval(data$Y.Coordinate, ybreaks)
+
+data$id <- id[cbind(xi, yi)]
+
+x2 <- findInterval(data$X.Coordinate.2, xbreaks)
+y2 <- findInterval(data$Y.Coordinate.2, ybreaks)
+
+data$id_two <- id[cbind(x2, y2)]
+###########needed for graphing references
+xbrk <- seq(-90, 90, length.out = 10)
+ybrk <- seq(-36.43, 36.43, length.out = 7)
+
+points <- merge(xbrk, ybrk)
+
+x_p <- findInterval(points$x, xbreaks)
+y_p <- findInterval(points$y, ybreaks)
+
+points$id <- id[cbind(x_p, y_p)]
+
+points <- points %>%
+  mutate(x_min = x - 10, 
+         x_max = x + 10, 
+         y_min = y - 6.07,
+         y_max = y + 6.07)
+```
+
+```{r fig.height=3, fig.width=5}
+med <- median(results$xAV)
+
+results %>%
+  ggplot() +
+  geom_rect(aes(xmin = x_min, xmax = x_max, ymin = y_min, ymax = y_max, color = xAV, fill = xAV)) +
+  scale_color_gradient2(low = "lightblue", mid = "white", midpoint = med, high = "red") +
+  scale_fill_gradient2(low = "lightblue", mid = "white", midpoint = med, high = "red")  +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.text = element_blank(),
+        axis.title = element_blank()) +
+  geom_segment(aes(x = 25 - 100, xend = 175 - 100, y = 0 - 42.5, yend = 0 - 42.5)) +
+  geom_segment(aes(x = 25 - 100, xend = 175 - 100, y = 85 - 42.5, yend = 85 - 42.5)) +
+  geom_segment(aes(x = 0 - 100, xend = 0 - 100, y = 20 - 42.5, yend = 60 - 42.5)) +
+  geom_segment(aes(x = 200 - 100, xend = 200 - 100, y = 20 - 42.5, yend = 60 - 42.5)) +
+  geom_curve(aes(x = 0 - 100, xend = 25 - 100, y = 60 - 42.5, yend = 85 - 42.5),
+             curvature = -0.32) +
+  geom_curve(aes(x = 0 - 100, xend = 25 - 100, y = 20 - 42.5, yend = 0 - 42.5),
+             curvature = 0.32) +
+  geom_curve(aes(x = 175 - 100, xend = 200 - 100, y = 0 - 42.5, yend = 20 - 42.5),
+             curvature = 0.32) +
+  geom_curve(aes(x = 175 - 100, xend = 200 -100, y = 85 - 42.5, yend = 60 - 42.5),
+             curvature = -0.32)  +
+  geom_path(data = goal, aes(x = goal_x - 100, y = goal_y - 42.5)) +
+  geom_segment(aes(x = 100 - 100, xend = 100 - 100, y = 85 - 42.5, yend = 0 - 42.5), size = 2, color = "red")  +
+  labs(title = "Average xAV by Location",
+       caption = "Ben Howell | @benhowell71 | benhowell71.com",
+       fill = "xAV") +
+  geom_path(data = goal, aes(x = goal_x - 100, y = goal_y - 42.5), size = 2) +
+  theme(panel.grid = element_blank(), 
+        axis.text = element_blank(),
+        axis.title = element_blank(),
+        plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+        plot.caption = element_text(hjust = 0.5, face = "italic", size = 10),
+        plot.subtitle = element_text(hjust = 0.5))
+```
+
+Now that we've created the formula and framework for $xAV$, here's a look at some of the highest-rated players by cumulative $xAV$ from the NWHL data and Olympic data we have. For comparison, I created an `xgboost` $xG$ model and added that score to our table.                  
+
+Given that the $xAV$ and $xG$ scores are cumulative, I've standardized them to 100 actions or shots. Many of the top $xG/100$ leaders are represented in the top 8 $xAV/100$ leaders in each league, but it's not a one-to-one comparison, which is a good thing! The discrepancy between $xAV/100$ and $xG/100$ indicates that they're measuring and valuing different things.             
+
+In our NWHL leaderboard, Boston and Toronto are the only teams represented. In our Olympic leaderboard, Canadian players take seven of the top eight $xAV/100$ spots. These teams have the most observations in their respective NWHL/Olympic dataset and, since I used 150 events as a cutoff, those teams are much more likely to have players hit that 150 event mark.         
+
+You can find an interactive plot of movement probabilites from zone to zone, as well as a full leaderboard of *xAV/100* and *xG* metrics [**here**](https://benhowell71.shinyapps.io/BigDataCupApp/).
+
+```{r}
+freq <- data %>%
+  group_by(League, Team) %>%
+  count(Team)
+
+# leaders %>%
+#   filter(League == "NWHL" & Events >= 150) %>%
+#   arrange(desc(xAV))
+
+leaders <- leaders %>%
+  mutate(Team_name = ifelse(Team == "Boston Pride", "Boston",
+                            ifelse(Team == "Buffalo Beauts", "Buffalo",
+                                   ifelse(Team == "Clarkson Golden Knights", "Clarkson",
+                                          ifelse(Team == "Connecticut Whale", "Connecticut",
+                                                 ifelse(Team == "Metropolitan Riveters", "Metropolitan",
+                                                        ifelse(Team == "Minnesota Whitecaps", "Minnesota",
+                                                               ifelse(Team == "Olympic (Women) - Canada", "Canada",
+                                                                      ifelse(Team == "Olympic (Women) - Finland", "Finland",
+                                                                             ifelse(Team == "Olympic (Women) - Olympic Athletes from Russia", "Russia",
+                                                                                    ifelse(Team == "Olympic (Women) - United States", "USA",
+                                                                                           ifelse(Team == "St. Lawrence Saints", "St. Lawrence",
+                                                                                                  ifelse(Team == "Toronto Six", "Toronto", NA)))))))))))))
+
+nwhl <- leaders %>%
+  filter(League == "NWHL") %>%
+  arrange(desc(xAV)) %>%
+  mutate(xAV_rank = row_number()) %>%
+  arrange(desc(xAV_100)) %>%
+  mutate(xAV_100_rank = row_number()) %>%
+  arrange(desc(xG)) %>%
+  mutate(xG_rank = row_number())  %>%
+  arrange(desc(xg_100)) %>%
+  mutate(xg_100_rank = row_number())
+
+bdc <- leaders %>%
+  filter(League == "BDC") %>%
+  arrange(desc(xAV)) %>%
+  mutate(xAV_rank = row_number()) %>%
+  arrange(desc(xAV_100)) %>%
+  mutate(xAV_100_rank = row_number()) %>%
+  arrange(desc(xG)) %>%
+  mutate(xG_rank = row_number())
+
+nwhl %>%
+  filter(Events >= 150) %>%
+  arrange(desc(xAV)) %>%
+  mutate(xAV_rank = row_number()) %>%
+  arrange(desc(xAV_100)) %>%
+  mutate(xAV_100_rank = row_number()) %>%
+  arrange(desc(xG)) %>%
+  mutate(xG_rank = row_number()) %>%
+  ungroup() %>%
+  mutate(Team = paste(Team_name)) %>%
+  arrange(desc(xg_100)) %>%
+  mutate(xg_100_rank = row_number()) %>%
+  dplyr::select(Team, Player, Events, xAV_100, xAV_100_rank, xg_100, xg_100_rank) %>%
+  arrange(xAV_100_rank) %>%
+  slice_head(n = 8) %>%
+  knitr::kable(booktabs = TRUE, linesep = "", caption = "NWHL xAV/100, xG/100 Comparison (min 150 Events)",
+               col.names = c("Team", "Player", "Events", "xAV/100", "xAV Rank", "xG/100", "xG Rank")) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"), font_size = 12,
+                position = "center") %>%
+  row_spec(0, bold = TRUE, font_size = 12)
+#top 6 in xAV are also top 6 in xAV/100
+
+bdc %>%
+  # filter(Events >= 150) %>%
+  # arrange(desc(xAV)) %>%
+  # mutate(xAV_rank = row_number()) %>%
+  # arrange(desc(xAV_100)) %>%
+  # mutate(xAV_100_rank = row_number()) %>%
+  # arrange(desc(xG)) %>%
+  # mutate(xG_rank = row_number()) %>%
+  # ungroup() %>%
+  # mutate(Team = paste(Team_name)) %>%
+  # arrange(desc(xg_100)) %>%
+  # mutate(xg_100_rank = row_number()) %>%
+  # dplyr::select(Team, Player, xAV, xAV_rank, xAV_100, xAV_100_rank, Goal, xG, xG_rank, xg_100, xg_100_rank) %>%
+  # arrange(xAV_100_rank) %>%
+  # slice_head(n = 8) %>%
+  # knitr::kable(booktabs = TRUE, linesep = "", caption = "Olympic xAV, xAV/100, xG Comparison (min 150 Events)",
+  #              col.names = c("Team", "Player", "xAV", "xAV Rank", "xAV/100", "xAV/100 Rank", "Goals", "xG", "xG Rank", "xG/100", "xG/100 Rank")) %>%
+  # kable_styling(latex_options = c("striped", "hold_position", "scale_down"), font_size = 12,
+  #               position = "center") %>%
+  # row_spec(0, bold = TRUE, font_size = 12)
+  filter(Events >= 150) %>%
+  arrange(desc(xAV)) %>%
+  mutate(xAV_rank = row_number()) %>%
+  arrange(desc(xAV_100)) %>%
+  mutate(xAV_100_rank = row_number()) %>%
+  arrange(desc(xG)) %>%
+  mutate(xG_rank = row_number()) %>%
+  ungroup() %>%
+  mutate(Team = paste(Team_name)) %>%
+  arrange(desc(xg_100)) %>%
+  mutate(xg_100_rank = row_number()) %>%
+  dplyr::select(Team, Player, Events, xAV_100, xAV_100_rank, xg_100, xg_100_rank) %>%
+  arrange(xAV_100_rank) %>%
+  slice_head(n = 8) %>%
+  knitr::kable(booktabs = TRUE, linesep = "", caption = "Olympic xAV/100, xG/100 Comparison (min 150 Events)",
+               col.names = c("Team", "Player", "Events", "xAV/100", "xAV Rank", "xG/100", "xG Rank")) %>%
+  kable_styling(latex_options = c("striped", "hold_position", "scale_down"), font_size = 12,
+                position = "center") %>%
+  row_spec(0, bold = TRUE, font_size = 12)
+```
+
+# Common Pass Types
+
+Now that I've defined *xAV* and shown specific player results, I was curious to see if there were any patterns in common pass types and how successful they were (using $xAV/100$).         
+
+I separated Direct and Indirect passes and ran a Gaussian Mixture Model (`Mclust` from the `mclust` package in R) to identify subsets of passes within the broader Direct/Indirect pass categories. Variables included in the clustering model include the start and end coordinates, the direction of the pass, and the distance the pass traveled from Point A to Point B.          
+
+```{r fig.width=8}
+data <- data %>%
+  mutate(pass_name = ifelse(Detail.1 == "Direct" & Cluster == 1, "Back out left",
+                            ifelse(Detail.1 == "Direct" & Cluster == 2, "Left to Right", 
+                                   ifelse(Detail.1 == "Direct" & Cluster == 3, "Left to Right Advance",
+                                          ifelse(Detail.1 == "Direct" & Cluster == 4, "Back out right",
+                                                 ifelse(Detail.1 == "Direct" & Cluster == 5, "Advance left",
+                                                        ifelse(Detail.1 == "Direct" & Cluster == 6, "Right to left advance",
+                                                               ifelse(Detail.1 == "Direct" & Cluster == 7, "Right to left",
+                                                                      ifelse(Detail.1 == "Direct" & Cluster == 8, "Short center pass",
+                                                                             ifelse(Detail.1 == "Direct" & Cluster == 9, "Advance right",
+                      ifelse(Detail.1 == "Indirect" & Cluster == 1, "Left corner approach",
+                             ifelse(Detail.1 == "Indirect" & Cluster == 2, "Puck hand-off",
+                                    ifelse(Detail.1 == "Indirect" & Cluster == 3, "Long board pass",
+                                           ifelse(Detail.1 == "Indirect" & Cluster == 4, "Right corner approach",
+                                                  ifelse(Detail.1 == "Indirect" & Cluster == 5, "Change poss right to left",
+                                                         ifelse(Detail.1 == "Indirect" & Cluster == 6, "Change poss left to right",
+                                                                ifelse(Detail.1 == "Indirect" & Cluster == 7, "Rim along right boards",
+                                                                       ifelse(Detail.1 == "Indirect" & Cluster == 8, "Rim along left boards", NA))))))))))))))))))
+
+pass_score <- data %>%
+  filter(! is.na(pass_name) & progressive_pass %in% c("Yes")) %>%
+  group_by(pass_name) %>%
+  summarise(sumxAV = sum(xAV),
+            passes = n()) %>%
+  mutate(xav_100 = round((sumxAV / passes)*100, digits = 4))
+
+set.seed(232)  
+
+data %>%
+  filter(! is.na(Cluster) & progressive_pass %in% c("Yes")) %>%
+  group_by(pass_name) %>%
+  right_join(pass_score, by = "pass_name") %>%
+  arrange(desc(xav_100)) %>%
+  mutate(xav_100_score = ifelse(Detail.1 == "Direct", paste0("(D) ", xav_100),
+                                paste0("(I) ", xav_100)),
+         xav_fac = as.factor(xav_100_score)) %>%
+  arrange(desc(xav_100)) %>%
+  slice_sample(prop = 0.1) %>%
+  ggplot() +
+  geom_point(aes(x = X.Coordinate, y = Y.Coordinate), size = 1) +
+  geom_segment(aes(x = X.Coordinate, y = Y.Coordinate, xend = X.Coordinate.2, yend = Y.Coordinate.2, color = xav_100), 
+               arrow = arrow(length = unit(0.15, "cm"), type = "closed")) +
+  facet_wrap(~factor(xav_100_score, 
+                     levels = c("(I) 0.0418", "(I) 0.0535", "(I) 0.0741", "(I) 0.1331",
+                                "(I) 0.4477", "(I) 0.462", "(I) 0.655", "(D) -0.8736",
+                                "(D) -0.0863", "(D) 0.1584", "(D) 0.1605",
+                                "(D) 0.2251", "(D) 0.4017", "(D) 0.6222",  
+                                "(D) 0.6924", "(D) 0.8241"))) + 
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+        plot.subtitle = element_text(hjust = 0.5)) +
+  geom_segment(aes(x = 25 - 100, xend = 175 - 100, y = 0 - 42.5, yend = 0 - 42.5)) +
+  geom_segment(aes(x = 25 - 100, xend = 175 - 100, y = 85 - 42.5, yend = 85 - 42.5)) +
+  geom_segment(aes(x = 0 - 100, xend = 0 - 100, y = 20 - 42.5, yend = 60 - 42.5)) +
+  geom_segment(aes(x = 200 - 100, xend = 200 - 100, y = 20 - 42.5, yend = 60 - 42.5)) +
+  geom_curve(aes(x = 0 - 100, xend = 25 - 100, y = 60 - 42.5, yend = 85 - 42.5),
+             curvature = -0.32) +
+  geom_curve(aes(x = 0 - 100, xend = 25 - 100, y = 20 - 42.5, yend = 0 - 42.5),
+             curvature = 0.32) +
+  geom_curve(aes(x = 175 - 100, xend = 200 - 100, y = 0 - 42.5, yend = 20 - 42.5),
+             curvature = 0.32) +
+  geom_curve(aes(x = 175 - 100, xend = 200 -100, y = 85 - 42.5, yend = 60 - 42.5),
+             curvature = -0.32)  +
+  geom_path(data = goal, aes(x = goal_x - 100, y = goal_y - 42.5)) +
+  geom_segment(aes(x = 100 - 100, xend = 100 - 100, y = 85 - 42.5, yend = 0 - 42.5), size = 2, color = "red") +
+  # geom_text(aes(x = 50, y = 0, label = xav_100)) +
+  scale_color_gradient2(low = "blue", mid = "lightgrey", midpoint = 0, high = "red") +
+  labs(color = "xAV/100",
+       title = "Progressive Pass Types",
+       subtitle = "2021 NWHL, 2018 Olympic Women's Hockey Data",
+       caption = "(D) or (I) indicate Direct or Indirect pass")
+```
+
+The model returned nine direct pass types and eight indirect pass types. However, I further pared it down to 16 total subsets when I removed passes that were not progressive and didn't move the puck towards the goal (defined by moving at least 25% closer).              
+
+Above is a visualization of each progressive pass type (only 10% of each type are shown for a cleaner visualization). Passes that center the puck sport the highest xAV/100; it would be interesting to compare this with a men's hockey dataset, as the limitations on body checking may open up the middle of the rink for these attacks. Most of the top pass types were direct passes, which may be related to the previous point as it's hard to consistently send indirect passes to the center of the ice.
+
+```{r}
+pass_freq <- data %>%
+  filter(! is.na(pass_name)) %>%
+  group_by(Team) %>%
+  count(pass_name) 
+
+ovr_passes <- data %>%
+  filter(! is.na(pass_name)) %>%
+  count(Team, name = c("passes"))
+
+pass_freq <- right_join(pass_freq, ovr_passes, by = c("Team"))
+
+total_pass <- nrow(passes)
+
+ovr_rate <- data %>%
+  filter(! is.na(pass_name)) %>%
+  count(pass_name, name = c("total")) %>%
+  mutate(ovr_rate = round(total / total_pass, digits = 4))
+
+pass_freq <- pass_freq %>%
+  mutate(freq = round(n / passes, digits = 4)) %>%
+  right_join(ovr_rate, by = c("pass_name")) %>%
+  mutate(diff = freq - ovr_rate)
+
+# sd(subset(pass_freq, pass_name %in% c("Advance left"))$freq)
+# mean(subset(pass_freq, pass_name %in% c("Advance left"))$freq)
+
+info <- pass_freq %>%
+  ungroup() %>%
+  group_by(pass_name) %>%
+  #we'll use the ovr_rate of each pass as the avg
+  summarise(sd = sd(freq))
+
+pass_freq <- right_join(pass_freq, info, by = c("pass_name"))
+
+pass_freq <- pass_freq %>%
+  #gives us a measure of which passes are over/under represented in each teams play style
+  mutate(z_score = (freq - ovr_rate) / sd)
+```
+
+# Next Steps
+
+There are a few ways to push this analysis further, primarily dealing with accounting for the skater situation on the rink (power-play or even strength). This would likely appear in a true xG or Pass Success Probability model in place of the $g_{xy}$ and $P_{xy -> zw}$ I ended up using, which were derived solely from the recorded events in the Big Data Cup dataset.              
+
+# Acknowledgements
+
+I would like to thank Stathletes for hosting the Big Data Cup and making their Olympics data available; open competitions like this are a great way to drive innovation and working with women's hockey was an exciting experience. I'd like to thank the NHWL for making their data available as well.           
+
+Thank you to two of my friends, Sweta Ghose and Abhi Mandalam, for looking over this paper and providing feedback.
+
+# Appendix
+
+- Interactive Movement Frequency Plot and full xAV leaderboard:      
+[https://benhowell71.shinyapps.io/BigDataCupApp/](https://benhowell71.shinyapps.io/BigDataCupApp/)
+- Code for this project is on GitHub:             
+[https://github.com/benhowell71/Big-Data-Cup](https://github.com/benhowell71/Big-Data-Cup)
+- Karun Singh's xT analysis for soccer:                
+[https://karun.in/blog/expected-threat.html](https://karun.in/blog/expected-threat.html)
+- Reading on Linear Weights in baseball from FanGraphs:                         
+[https://library.fangraphs.com/principles/linear-weights/](https://library.fangraphs.com/principles/linear-weights/)
